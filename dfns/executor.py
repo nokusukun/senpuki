@@ -403,6 +403,12 @@ class DFns:
         """
         return await self.backend.count_tasks(queue=queue, state="pending")
 
+    async def get_running_activities(self) -> List[TaskRecord]:
+        """
+        Returns a list of currently running tasks (activities).
+        """
+        return await self.backend.list_tasks(limit=100, state="running")
+
     async def serve(
         self,
         *,
@@ -425,7 +431,7 @@ class DFns:
             # But asyncio.Semaphore doesn't have a check without acquire. 
             # We acquire first, then claim.
             await sem.acquire()
-            
+
             try:
                 task = await self.backend.claim_next_task(
                     worker_id=worker_id,

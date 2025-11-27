@@ -225,6 +225,22 @@ class SQLiteBackend(Backend):
             ))
             await db.commit()
 
+    async def list_tasks(self, limit: int = 10, offset: int = 0, state: str | None = None) -> List[TaskRecord]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            query = "SELECT * FROM tasks"
+            params = []
+            if state:
+                query += " WHERE state = ?"
+                params.append(state)
+            
+            query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+            
+            async with db.execute(query, params) as cursor:
+                rows = await cursor.fetchall()
+                return [self._row_to_task(row) for row in rows]
+
     async def claim_next_task(
         self,
         *,

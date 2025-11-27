@@ -240,5 +240,8 @@ See the `examples/` folder for complete code:
 1.  **`simple_flow.py`**: Basic parent-child function calls.
 2.  **`failing_flow.py`**: Demonstrates automatic retries and Dead Letter Queue (DLQ) behavior.
 3.  **`complex_workflow.py`**: A data pipeline showcasing caching, retries, and timeouts.
-4.  **`batch_processing.py`**: High-concurrency fan-out/fan-in image processing simulation.
-5.  **`saga_trip_booking.py`**: Implementing the **Saga Pattern** with compensating transactions (rollbacks) to handle distributed failures gracefully.
+*   `batch_processing.py`: Fan-out/fan-in pattern (processing multiple items in parallel).
+*   `saga_trip_booking.py`: Saga pattern with compensation (rollback) logic.
+*   `media_pipeline.py`: A complex 5-minute simulation of a media processing pipeline (Validation -> Safety -> Transcode/AI -> Package) with a live progress dashboard.
+
+## Requirements

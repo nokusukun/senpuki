@@ -131,4 +131,4 @@ class ExecutionState:
             elif p.started_at:
                  duration = "(...)"
             parts.append(f"{p.step}{duration}")
-        return f"{self.progress[0].step}(begin) > " + " > ".join(parts)
+        return f"{self.progress[0].step if len(self.progress) else '(begin)'} > " + " > ".join(parts)
