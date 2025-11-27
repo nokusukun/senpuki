@@ -1,0 +1,111 @@
+import unittest
+import asyncio
+import os
+import logging
+from dfns import DFns, Result, RetryPolicy
+from dfns.registry import registry
+
+logging.basicConfig(level=logging.DEBUG)
+
+# Mock "LLM" Generation
+@DFns.durable()
+async def generate_text(prompt: str) -> str:
+    # Simulate processing time
+    # print(f"Executing generate_text for: {prompt}")
+    await asyncio.sleep(0.5)
+    return f"Generated text for: {prompt}"
+
+@DFns.durable(cached=True)
+async def get_cached_data(key: str) -> str:
+    # print(f"Executing get_cached_data for: {key}")
+    await asyncio.sleep(0.2) # Simulate work
+    return f"Data for {key} from actual computation"
+
+# Mock "Email" Notification (Side Effect)
+SENT_EMAILS = []
+
+@DFns.durable(idempotent=True) # Idempotent to avoid sending twice on retries of parent
+async def send_email(recipient: str, body: str):
+    SENT_EMAILS.append((recipient, body))
+    return True
+
+@DFns.durable()
+async def llm_workflow(prompt: str, email: str) -> Result[str, Exception]:
+    # Step 1: Generate
+    text = await generate_text(prompt)
+    
+    # Step 2: Notify
+    await send_email(email, text)
+    
+    return Result.Ok("Workflow Completed")
+
+@DFns.durable()
+async def parent_durable_task(value: int) -> Result[int, Exception]:
+    # Calls another durable task
+    res = await child_durable_task(value * 2)
+    return Result.Ok(res + 1)
+
+@DFns.durable()
+async def child_durable_task(value: int) -> int:
+    return value + 10
+
+@DFns.durable()
+async def step_sleep():
+    await asyncio.sleep(0.5)
+    return "slept"
+
+@DFns.durable()
+async def slow_chain_workflow():
+    await step_sleep()
+    await step_sleep()
+    await step_sleep()
+    return "done"
+
+class TestScenarios(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.db_path = f"test_scenarios_{os.getpid()}.sqlite"
+        self.backend = DFns.backends.SQLiteBackend(self.db_path)
+        await self.backend.init_db()
+        self.executor = DFns(backend=self.backend)
+        self.worker_task = asyncio.create_task(self.executor.serve(poll_interval=0.1))
+        SENT_EMAILS.clear()
+
+    async def asyncTearDown(self):
+        self.worker_task.cancel()
+        try:
+            await self.worker_task
+        except asyncio.CancelledError:
+            pass
+        if os.path.exists(self.db_path):
+            os.remove(self.db_path)
+
+    async def test_llm_email_scenario(self):
+        prompt = "Write a poem about Python"
+        recipient = "user@example.com"
+        
+        exec_id = await self.executor.dispatch(llm_workflow, prompt, recipient)
+        
+        # Wait for result
+        result = await self._wait_for_result(exec_id)
+        
+        self.assertTrue(result.ok)
+        self.assertEqual(result.value, "Workflow Completed")
+        
+        # Verify side effects
+        self.assertEqual(len(SENT_EMAILS), 1)
+        self.assertEqual(SENT_EMAILS[0][0], recipient)
+        self.assertIn("Generated text for: Write a poem about Python", SENT_EMAILS[0][1])
+
+        # Verify progress tracking
+        state = await self.executor.state_of(exec_id)
+        steps = [p.step for p in state.progress]
+        self.assertTrue(any("generate_text" in s for s in steps), f"generate_text not found in steps: {steps}")
+        self.assertTrue(any("send_email" in s for s in steps), f"send_email not found in steps: {steps}")
+
+    async def _wait_for_result(self, exec_id):
+        while True:
+            state = await self.executor.state_of(exec_id)
+            if state.state in ("completed", "failed", "timed_out"):
+                break
+            await asyncio.sleep(0.1)
+        return await self.executor.result_of(exec_id)
