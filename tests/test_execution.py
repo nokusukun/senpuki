@@ -2,7 +2,7 @@ import unittest
 import asyncio
 import os
 import shutil
-from datetime import timedelta
+from datetime import datetime, timedelta
 from dfns import DFns, Result, RetryPolicy
 from dfns.backend.sqlite import SQLiteBackend
 from dfns.registry import registry
@@ -216,6 +216,47 @@ class TestExecution(unittest.IsolatedAsyncioTestCase):
             await worker2
         except asyncio.CancelledError:
             pass
+
+    async def test_cleanup(self):
+        # Stop default worker to manually control execution
+        self.worker_task.cancel()
+        try:
+            await self.worker_task
+        except asyncio.CancelledError:
+            pass
+            
+        # 1. Run a task to completion
+        # We need a worker for this
+        worker = asyncio.create_task(self.executor.serve(poll_interval=0.1))
+        
+        exec_id = await self.executor.dispatch(simple_task, 99)
+        result = await self._wait_for_result(exec_id)
+        self.assertEqual(result.value, 198)
+        
+        # 2. Dispatch a task that will stay pending (we'll stop worker)
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
+            
+        exec_pending_id = await self.executor.dispatch(simple_task, 100)
+        
+        # 3. Cleanup with future cutoff
+        # This should delete the completed task, but NOT the pending one
+        cutoff = datetime.now() + timedelta(days=1)
+        
+        count = await self.backend.cleanup_executions(cutoff)
+        self.assertGreaterEqual(count, 1)
+        
+        # Verify completed is gone
+        rec = await self.backend.get_execution(exec_id)
+        self.assertIsNone(rec)
+        
+        # Verify pending is present
+        rec_pending = await self.backend.get_execution(exec_pending_id)
+        self.assertIsNotNone(rec_pending)
+        self.assertEqual(rec_pending.state, "pending")
 
 
     async def _wait_for_result(self, exec_id):

@@ -357,6 +357,20 @@ class SQLiteBackend(Backend):
             )
             await db.commit()
 
+    async def cleanup_executions(self, older_than: datetime) -> int:
+        async with aiosqlite.connect(self.db_path) as db:
+            where_clause = "completed_at IS NOT NULL AND completed_at < ? AND state IN ('completed', 'failed', 'timed_out', 'cancelled')"
+            
+            # Delete dependents using subquery
+            await db.execute(f"DELETE FROM tasks WHERE execution_id IN (SELECT id FROM executions WHERE {where_clause})", (older_than,))
+            await db.execute(f"DELETE FROM execution_progress WHERE execution_id IN (SELECT id FROM executions WHERE {where_clause})", (older_than,))
+            
+            # Delete executions
+            async with db.execute(f"DELETE FROM executions WHERE {where_clause}", (older_than,)) as cursor:
+                count = cursor.rowcount
+            await db.commit()
+            return count
+
     def _progress_to_dict(self, p: ExecutionProgress) -> dict:
         return {
             "step": p.step,

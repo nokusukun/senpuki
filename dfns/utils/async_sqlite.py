@@ -6,6 +6,10 @@ class AsyncCursor:
     def __init__(self, cursor: sqlite3.Cursor):
         self._cursor = cursor
 
+    @property
+    def rowcount(self):
+        return self._cursor.rowcount
+
     async def fetchone(self) -> Any:
         return await asyncio.to_thread(self._cursor.fetchone)
 

@@ -428,6 +428,8 @@ class DFns:
         max_concurrency: int = 10,
         lease_duration: timedelta = timedelta(minutes=5),
         poll_interval: float = 1.0,
+        cleanup_interval: float | None = 3600.0, # Default 1 hour
+        retention_period: timedelta = timedelta(days=7),
     ):
         if not worker_id:
             worker_id = str(uuid.uuid4())
@@ -435,32 +437,65 @@ class DFns:
         sem = asyncio.Semaphore(max_concurrency)
         logger.info(f"Worker {worker_id} started. Queues: {queues}")
         
-        while True:
-            # Check if we can acquire
-            # We don't want to block here, just check if sem is full
-            # But asyncio.Semaphore doesn't have a check without acquire. 
-            # We acquire first, then claim.
-            await sem.acquire()
+        cleanup_task = None
+        if cleanup_interval is not None:
+            cleanup_task = asyncio.create_task(self._cleanup_loop(retention_period, cleanup_interval))
 
-            try:
-                task = await self.backend.claim_next_task(
-                    worker_id=worker_id,
-                    queues=queues,
-                    tags=tags,
-                    now=datetime.now(),
-                    lease_duration=lease_duration
-                )
-                
-                if task:
-                    # Run in background
-                    asyncio.create_task(self._handle_task(task, worker_id, lease_duration, sem))
-                else:
+        try:
+            while True:
+                # Check if we can acquire
+                # We don't want to block here, just check if sem is full
+                # But asyncio.Semaphore doesn't have a check without acquire. 
+                # We acquire first, then claim.
+                await sem.acquire()
+
+                try:
+                    task = await self.backend.claim_next_task(
+                        worker_id=worker_id,
+                        queues=queues,
+                        tags=tags,
+                        now=datetime.now(),
+                        lease_duration=lease_duration
+                    )
+                    
+                    if task:
+                        # Run in background
+                        asyncio.create_task(self._handle_task(task, worker_id, lease_duration, sem))
+                    else:
+                        sem.release()
+                        await asyncio.sleep(poll_interval)
+                except Exception as e:
                     sem.release()
+                    logger.error(f"Error in worker loop: {e}")
                     await asyncio.sleep(poll_interval)
+        except asyncio.CancelledError:
+            logger.info("Worker cancelled")
+            raise
+        finally:
+            if cleanup_task:
+                cleanup_task.cancel()
+                try:
+                    await cleanup_task
+                except asyncio.CancelledError:
+                    pass
+
+    async def _cleanup_loop(self, retention: timedelta, interval: float):
+        logger.info(f"Starting cleanup loop. Retention: {retention}, Interval: {interval}s")
+        while True:
+            try:
+                # Jitter the startup/interval slightly to avoid thundering herd if multiple workers start at once
+                # But simple sleep is fine for now
+                await asyncio.sleep(interval)
+                
+                cutoff = datetime.now() - retention
+                count = await self.backend.cleanup_executions(cutoff)
+                if count > 0:
+                    logger.info(f"Cleaned up {count} old executions (older than {cutoff})")
+            except asyncio.CancelledError:
+                break
             except Exception as e:
-                sem.release()
-                logger.error(f"Error in worker loop: {e}")
-                await asyncio.sleep(poll_interval)
+                logger.error(f"Cleanup failed: {e}")
+                await asyncio.sleep(60) # Wait a bit before retrying on error
 
     async def _handle_task(
         self, 
