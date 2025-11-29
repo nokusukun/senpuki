@@ -285,6 +285,7 @@ class DFns:
         fn: Callable[..., Awaitable[Any]],
         *args,
         expiry: str | timedelta | None = None,
+        max_duration: str | timedelta | None = None,
         delay: str | dict | timedelta | None = None,
         tags: List[str] | None = None,
         priority: int = 0,
@@ -298,6 +299,12 @@ class DFns:
             # Register on the fly if not decorated? Or fail? 
             # Better to assume it was decorated.
             pass
+
+        if expiry and max_duration:
+            raise ValueError("Cannot provide both 'expiry' and 'max_duration'. Use 'max_duration' as 'expiry' is deprecated.")
+
+        if max_duration:
+            expiry = max_duration
 
         if isinstance(expiry, str):
             expiry = parse_duration(expiry)
