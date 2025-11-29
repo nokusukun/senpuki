@@ -20,6 +20,9 @@ from dfns.utils.time import parse_duration
 
 logger = logging.getLogger(__name__)
 
+# Capture original sleep before any patching
+_original_sleep = asyncio.sleep
+
 current_execution_id: ContextVar[str | None] = ContextVar("dfns_execution_id", default=None)
 current_task_id: ContextVar[str | None] = ContextVar("dfns_task_id", default=None)
 current_worker_semaphore: ContextVar[asyncio.Semaphore | None] = ContextVar("dfns_worker_semaphore", default=None)
@@ -43,6 +46,68 @@ class DFns:
             self.serializer = serializer
             
         self.notification_backend = notification_backend
+        
+        self._register_builtin_tasks()
+        self._patch_asyncio_sleep()
+
+    def _register_builtin_tasks(self):
+        async def sleep_impl(duration: float):
+            pass
+            
+        meta = FunctionMetadata(
+            name="dfns.sleep",
+            fn=sleep_impl,
+            cached=False,
+            retry_policy=RetryPolicy(),
+            tags=["builtin"],
+            priority=0,
+            queue=None,
+            idempotent=True,
+            idempotency_key_func=None,
+            version="1.0"
+        )
+        registry.register(meta)
+
+    def _patch_asyncio_sleep(self):
+        if getattr(asyncio.sleep, "_is_dfns_patch", False):
+            return
+
+        original_sleep = asyncio.sleep
+        
+        @functools.wraps(original_sleep)
+        async def warning_sleep(delay, result=None):
+            if current_execution_id.get():
+                 logger.warning(f"Detected asyncio.sleep({delay}) inside a durable function. Use 'await dfns.sleep(...)' to release worker capacity.")
+            return await original_sleep(delay, result)
+        
+        warning_sleep._is_dfns_patch = True
+        asyncio.sleep = warning_sleep
+
+    async def schedule(
+        self, 
+        delay: str | dict | timedelta, 
+        fn: Callable[..., Awaitable[Any]], 
+        *args, 
+        **kwargs
+    ) -> str:
+        """
+        Schedule a function to run after a specific delay.
+        """
+        return await self.dispatch(fn, *args, delay=delay, **kwargs)
+
+    async def sleep(self, duration: str | dict | timedelta):
+        """
+        Sleep for a specific duration. 
+        This releases the worker to process other tasks while waiting.
+        """
+        d = parse_duration(duration)
+        meta = registry.get("dfns.sleep")
+        if not meta:
+             raise Exception("dfns.sleep not registered")
+        
+        # Schedule the sleep task to run AFTER the duration.
+        # The orchestrator will wait for it to complete.
+        await self._schedule_activity(meta, (d.total_seconds(),), {}, None, delay=d)
 
     @classmethod
     def durable(
@@ -194,6 +259,7 @@ class DFns:
         fn: Callable[..., Awaitable[Any]],
         *args,
         timeout: str | timedelta | None = None,
+        delay: str | dict | timedelta | None = None,
         tags: List[str] | None = None,
         priority: int = 0,
         queue: str | None = None,
@@ -209,9 +275,22 @@ class DFns:
 
         if isinstance(timeout, str):
             timeout = parse_duration(timeout)
+            
+        scheduled_for = None
+        if delay:
+            if isinstance(delay, (str, dict)):
+                delay = parse_duration(delay)
+            scheduled_for = datetime.now() + delay
         
-        timeout_at = datetime.now() + timeout if timeout else None
-        
+        timeout_at = (datetime.now() + timeout) if timeout else None
+        if scheduled_for and timeout:
+             # Timeout should start AFTER scheduled start? 
+             # For now simple logic: timeout is absolute or relative to dispatch?
+             # Standard: relative to dispatch usually, but if delayed, maybe relative to start.
+             # Let's keep it simple: timeout_at is absolute. If delay > timeout, it times out immediately.
+             # User should set timeout appropriately.
+             timeout_at = scheduled_for + timeout
+
         execution_id = str(uuid.uuid4())
         
         record = ExecutionRecord(
@@ -245,7 +324,8 @@ class DFns:
             tags=record.tags,
             priority=priority,
             queue=record.queue,
-            retry_policy=meta.retry_policy if meta else RetryPolicy()
+            retry_policy=meta.retry_policy if meta else RetryPolicy(),
+            scheduled_for=scheduled_for
         )
         
         await self.backend.create_execution(record)
@@ -253,10 +333,21 @@ class DFns:
         
         return execution_id
 
-    async def _schedule_activity(self, meta: FunctionMetadata, args: tuple, kwargs: dict, idempotency_key: str | None) -> TaskRecord:
+    async def _schedule_activity(
+        self, 
+        meta: FunctionMetadata, 
+        args: tuple, 
+        kwargs: dict, 
+        idempotency_key: str | None,
+        delay: timedelta | None = None
+    ) -> TaskRecord:
         exec_id = current_execution_id.get()
         parent_id = current_task_id.get()
         
+        scheduled_for = None
+        if delay:
+            scheduled_for = datetime.now() + delay
+
         task_id = str(uuid.uuid4())
         task = TaskRecord(
             id=task_id,
@@ -273,12 +364,13 @@ class DFns:
             priority=meta.priority,
             queue=meta.queue,
             retry_policy=meta.retry_policy,
-            idempotency_key=idempotency_key # Store the key received from _call_durable_stub
+            idempotency_key=idempotency_key, # Store the key received from _call_durable_stub
+            scheduled_for=scheduled_for
         )
         
         await self.backend.create_task(task)
         await self.backend.append_progress(exec_id, ExecutionProgress(
-            step=meta.name, status="dispatched"
+            step=meta.name, status="dispatched", detail=f"Scheduled for {delay}" if delay else None
         ))
         
         completed_task = await self._wait_for_task(task_id)
@@ -309,7 +401,7 @@ class DFns:
                         return task
                     if timeout and (datetime.now() - start).total_seconds() > timeout:
                          raise TimeoutError(f"Task {task_id} timed out")
-                    await asyncio.sleep(0.1)
+                    await _original_sleep(0.1)
         finally:
             if sem:
                 await sem.acquire()
@@ -463,11 +555,11 @@ class DFns:
                         asyncio.create_task(self._handle_task(task, worker_id, lease_duration, sem))
                     else:
                         sem.release()
-                        await asyncio.sleep(poll_interval)
+                        await _original_sleep(poll_interval)
                 except Exception as e:
                     sem.release()
                     logger.error(f"Error in worker loop: {e}")
-                    await asyncio.sleep(poll_interval)
+                    await _original_sleep(poll_interval)
         except asyncio.CancelledError:
             logger.info("Worker cancelled")
             raise
@@ -485,7 +577,7 @@ class DFns:
             try:
                 # Jitter the startup/interval slightly to avoid thundering herd if multiple workers start at once
                 # But simple sleep is fine for now
-                await asyncio.sleep(interval)
+                await _original_sleep(interval)
                 
                 cutoff = datetime.now() - retention
                 count = await self.backend.cleanup_executions(cutoff)
@@ -495,7 +587,7 @@ class DFns:
                 break
             except Exception as e:
                 logger.error(f"Cleanup failed: {e}")
-                await asyncio.sleep(60) # Wait a bit before retrying on error
+                await _original_sleep(60) # Wait a bit before retrying on error
 
     async def _handle_task(
         self, 
@@ -694,3 +786,16 @@ class Notifications:
 
 DFns.backends = Backends
 DFns.notifications = Notifications
+
+async def sleep(duration: str | dict | timedelta):
+    """
+    Global sleep helper that uses the current executor context if available,
+    otherwise falls back to asyncio.sleep (non-durable).
+    """
+    executor = current_executor.get()
+    if executor:
+        await executor.sleep(duration)
+    else:
+        # Fallback for local testing or non-durable usage
+        d = parse_duration(duration)
+        await asyncio.sleep(d.total_seconds())

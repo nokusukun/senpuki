@@ -103,6 +103,7 @@ class TaskRecord:
     worker_id: str | None = None
     lease_expires_at: datetime | None = None
     idempotency_key: str | None = None
+    scheduled_for: datetime | None = None
 
 @dataclass
 class ExecutionState:

@@ -77,7 +77,8 @@ class SQLiteBackend(Backend):
                     priority INTEGER,
                     queue TEXT,
                     idempotency_key TEXT,
-                    retry_policy TEXT
+                    retry_policy TEXT,
+                    scheduled_for TIMESTAMP
                 )
             """)
             await db.execute("""
@@ -177,13 +178,13 @@ class SQLiteBackend(Backend):
     async def create_task(self, task: TaskRecord) -> None:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
-                "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     task.id, task.execution_id, task.step_name, task.kind, task.parent_task_id,
                     task.state, task.args, task.kwargs, task.result, task.error, task.retries,
                     task.created_at, task.started_at, task.completed_at, task.worker_id,
                     task.lease_expires_at, json.dumps(task.tags), task.priority, task.queue,
-                    task.idempotency_key, self._policy_to_json(task.retry_policy)
+                    task.idempotency_key, self._policy_to_json(task.retry_policy), task.scheduled_for
                 )
             )
             await db.commit()
@@ -259,7 +260,7 @@ class SQLiteBackend(Backend):
         
         # Helper for queues condition
         queue_clause = ""
-        params: List[Any] = [worker_id, expires_at, now, now]
+        params: List[Any] = [worker_id, expires_at, now, now, now]
         if queues:
             placeholders = ",".join(["?"] * len(queues))
             queue_clause = f"AND (queue IN ({placeholders}) OR queue IS NULL)"
@@ -272,6 +273,7 @@ class SQLiteBackend(Backend):
             db.row_factory = aiosqlite.Row
             # Using sub-select for claim
             # Claim if pending OR (running AND lease expired)
+            # AND scheduled_for is effectively passed
             query = f"""
                 UPDATE tasks
                 SET state='running', worker_id=?, lease_expires_at=?, started_at=?
@@ -281,6 +283,7 @@ class SQLiteBackend(Backend):
                         state='pending'
                         OR (state='running' AND lease_expires_at < ?)
                     )
+                    AND (scheduled_for IS NULL OR scheduled_for <= ?)
                       {queue_clause}
                     ORDER BY priority DESC, created_at ASC
                     LIMIT 1
@@ -452,5 +455,6 @@ class SQLiteBackend(Backend):
             priority=row["priority"],
             queue=row["queue"],
             idempotency_key=row["idempotency_key"],
-            retry_policy=self._json_to_policy(row["retry_policy"])
+            retry_policy=self._json_to_policy(row["retry_policy"]),
+            scheduled_for=datetime.fromisoformat(row["scheduled_for"]) if row["scheduled_for"] and isinstance(row["scheduled_for"], str) else row["scheduled_for"]
         )
