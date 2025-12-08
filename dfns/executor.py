@@ -18,10 +18,27 @@ from dfns.utils.serialization import Serializer, JsonSerializer
 from dfns.utils.idempotency import default_idempotency_key
 from dfns.utils.time import parse_duration
 
+from dataclasses import dataclass
+
 logger = logging.getLogger(__name__)
 
 class ExpiryError(TimeoutError):
     pass
+
+@dataclass
+class PermitHolder:
+    sem: asyncio.Semaphore
+    held: bool = True
+
+    def release(self):
+        if self.held:
+            self.sem.release()
+            self.held = False
+    
+    async def acquire(self):
+        if not self.held:
+            await self.sem.acquire()
+            self.held = True
 
 # Backends helper
 class Backends:
@@ -52,6 +69,7 @@ _original_sleep = asyncio.sleep
 current_execution_id: ContextVar[str | None] = ContextVar("dfns_execution_id", default=None)
 current_task_id: ContextVar[str | None] = ContextVar("dfns_task_id", default=None)
 current_worker_semaphore: ContextVar[asyncio.Semaphore | None] = ContextVar("dfns_worker_semaphore", default=None)
+current_permit_holder: ContextVar[PermitHolder | None] = ContextVar("dfns_permit_holder", default=None)
 
 class DFns:
     backends = Backends
@@ -332,30 +350,40 @@ class DFns:
                         step=meta.name, status="dispatched"
                     ))
         
-        # Wait for all
-        async def waiter(item):
-            if isinstance(item, TaskRecord):
-                completed = await executor._wait_for_task(item.id)
-                if completed.state == "failed":
-                    if completed.error:
-                        err = executor.serializer.loads(completed.error)
-                        if isinstance(err, BaseException):
-                             raise err
-                        raise Exception(str(err))
-                    raise Exception("Task failed")
-                
-                res = executor.serializer.loads(completed.result)
-                # Store cache/idempotency
-                if item.idempotency_key:
-                    if meta.cached:
-                        await executor.backend.set_cached_result(item.idempotency_key, completed.result)
-                    if meta.idempotent:
-                        await executor.backend.set_idempotency_result(item.idempotency_key, completed.result)
-                return res
-            else:
-                return item
+        # Optimized wait for all
+        # We release the permit ONCE for the whole batch
+        permit = current_permit_holder.get()
+        if permit:
+            permit.release()
 
-        return await asyncio.gather(*[waiter(item) for item in results_or_tasks])
+        try:
+            async def waiter(item):
+                if isinstance(item, TaskRecord):
+                    # Use internal wait that DOES NOT touch semaphore
+                    completed = await executor._wait_for_task_internal(item.id)
+                    if completed.state == "failed":
+                        if completed.error:
+                            err = executor.serializer.loads(completed.error)
+                            if isinstance(err, BaseException):
+                                 raise err
+                            raise Exception(str(err))
+                        raise Exception("Task failed")
+                    
+                    res = executor.serializer.loads(completed.result)
+                    # Store cache/idempotency
+                    if item.idempotency_key:
+                        if meta.cached:
+                            await executor.backend.set_cached_result(item.idempotency_key, completed.result)
+                        if meta.idempotent:
+                            await executor.backend.set_idempotency_result(item.idempotency_key, completed.result)
+                    return res
+                else:
+                    return item
+
+            return await asyncio.gather(*[waiter(item) for item in results_or_tasks])
+        finally:
+            if permit:
+                await permit.acquire()
 
     @classmethod
     async def gather(cls, *tasks):
@@ -573,36 +601,39 @@ class DFns:
         
         return completed_task # Return completed_task, _call_durable_stub handles errors and result processing
 
+    async def _wait_for_task_internal(self, task_id: str, expiry: float | None = None) -> TaskRecord:
+        """Waits for task completion without modifying semaphore."""
+        if self.notification_backend:
+            # Subscribe and wait
+            it = self.notification_backend.subscribe_to_task(task_id, expiry=expiry)
+            async for _ in it:
+                pass 
+            # After loop (completion or expiry), fetch latest
+            task = await self.backend.get_task(task_id)
+            if not task:
+                raise ValueError(f"Task not found after notification: {task_id}")
+            return task
+        else:
+            # Poll
+            start = datetime.now()
+            while True:
+                task = await self.backend.get_task(task_id)
+                if task and task.state in ("completed", "failed"):
+                    return task
+                if expiry and (datetime.now() - start).total_seconds() > expiry:
+                        raise ExpiryError(f"Task {task_id} timed out")
+                await _original_sleep(0.1)
+
     async def _wait_for_task(self, task_id: str, expiry: float | None = None) -> TaskRecord:
-        # Release semaphore to allow other tasks to run while we wait (prevent deadlock in low concurrency)
-        sem = current_worker_semaphore.get()
-        if sem:
-            sem.release()
+        permit = current_permit_holder.get()
+        if permit:
+            permit.release()
             
         try:
-            if self.notification_backend:
-                # Subscribe and wait
-                it = self.notification_backend.subscribe_to_task(task_id, expiry=expiry)
-                async for _ in it:
-                    pass 
-                # After loop (completion or expiry), fetch latest
-                task = await self.backend.get_task(task_id)
-                if not task:
-                    raise ValueError(f"Task not found after notification: {task_id}")
-                return task
-            else:
-                # Poll
-                start = datetime.now()
-                while True:
-                    task = await self.backend.get_task(task_id)
-                    if task and task.state in ("completed", "failed"):
-                        return task
-                    if expiry and (datetime.now() - start).total_seconds() > expiry:
-                         raise ExpiryError(f"Task {task_id} timed out")
-                    await _original_sleep(0.1)
+            return await self._wait_for_task_internal(task_id, expiry)
         finally:
-            if sem:
-                await sem.acquire()
+            if permit:
+                await permit.acquire()
 
     async def state_of(self, execution_id: str) -> ExecutionState:
         record = await self.backend.get_execution(execution_id)
@@ -798,6 +829,7 @@ class DFns:
         token_task = current_task_id.set(task.id)
         token_executor = current_executor.set(self)
         token_sem = current_worker_semaphore.set(sem)
+        token_permit = current_permit_holder.set(PermitHolder(sem))
         
         try:
             # Check execution state or expiry
@@ -962,6 +994,7 @@ class DFns:
             current_task_id.reset(token_task)
             current_executor.reset(token_executor)
             current_worker_semaphore.reset(token_sem)
+            current_permit_holder.reset(token_permit)
 
 # Context var for executor instance
 current_executor: ContextVar[Optional[DFns]] = ContextVar("dfns_executor", default=None)
