@@ -16,8 +16,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/nokusukun/dfns"
-Issues = "https://github.com/nokusukun/dfns/issues"
+Homepage = "https://github.com/nokusukun/senpuki"
+Issues = "https://github.com/nokusukun/senpuki/issues"
 
 [dependency-groups]
 dev = [
