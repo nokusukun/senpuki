@@ -140,3 +140,26 @@ async def test_sqlite_concurrency_limits_respected(tmp_path):
     assert second_claim is not None
 
     await cleanup_test_backend(backend)
+
+
+@pytest.mark.asyncio
+async def test_dead_letter_round_trip(tmp_path):
+    backend = SQLiteBackend(str(tmp_path / "dlq.sqlite"))
+    await backend.init_db()
+
+    exec_id = "exec-dlq"
+    await backend.create_execution(_make_execution(exec_id))
+    task = _make_task(exec_id, "task-dlq")
+    await backend.create_task(task)
+
+    await backend.move_task_to_dead_letter(task, "boom")
+    records = await backend.list_dead_tasks()
+    assert len(records) == 1
+    record = await backend.get_dead_task(task.id)
+    assert record is not None
+    assert record.task.execution_id == exec_id
+    deleted = await backend.delete_dead_task(task.id)
+    assert deleted
+    assert await backend.list_dead_tasks() == []
+
+    await cleanup_test_backend(backend)

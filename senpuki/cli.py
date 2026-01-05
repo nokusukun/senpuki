@@ -51,6 +51,37 @@ async def show_execution(executor: Senpuki, args):
     if state.result is not None:
         print(f"\nResult: {state.result}")
 
+async def dlq_list(executor: Senpuki, args):
+    records = await executor.list_dead_letters(limit=args.limit)
+    if not records:
+        print("Dead-letter queue is empty.")
+        return
+    print(f"{'Task ID':<36} | {'Execution':<36} | {'Step':<20} | {'Reason'}")
+    print("-" * 120)
+    for record in records:
+        task = record.task
+        reason = (record.reason or "")[:40]
+        print(f"{task.id:<36} | {task.execution_id:<36} | {task.step_name:<20} | {reason}")
+
+async def dlq_show(executor: Senpuki, args):
+    record = await executor.get_dead_letter(args.id)
+    if not record:
+        print(f"Dead-letter task {args.id} not found.")
+        return
+    task = record.task
+    print(f"Task ID: {task.id}")
+    print(f"Execution ID: {task.execution_id}")
+    print(f"Step: {task.step_name} ({task.kind})")
+    print(f"Queue: {task.queue or 'default'}")
+    print(f"Reason: {record.reason}")
+    print(f"Moved At: {record.moved_at.isoformat()}")
+    print(f"Retries: {task.retries}")
+    print(f"Tags: {', '.join(task.tags) if task.tags else '-'}")
+
+async def dlq_replay(executor: Senpuki, args):
+    new_id = await executor.replay_dead_letter(args.id, queue=args.queue)
+    print(f"Requeued dead-letter task {args.id} as {new_id}.")
+
 async def main_async():
     parser = argparse.ArgumentParser(description="Senpuki CLI")
     default_db = os.environ.get("SENPUKI_DB", "senpuki.sqlite")
@@ -64,6 +95,16 @@ async def main_async():
     
     show_parser = subparsers.add_parser("show", help="Show execution details")
     show_parser.add_argument("id", help="Execution ID")
+
+    dlq_parser = subparsers.add_parser("dlq", help="Dead-letter queue operations")
+    dlq_sub = dlq_parser.add_subparsers(dest="dlq_command", required=True)
+    dlq_list_parser = dlq_sub.add_parser("list", help="List DLQ entries")
+    dlq_list_parser.add_argument("--limit", type=int, default=20, help="Number of DLQ items to display")
+    dlq_show_parser = dlq_sub.add_parser("show", help="Show DLQ entry details")
+    dlq_show_parser.add_argument("id", help="Dead-letter task ID")
+    dlq_replay_parser = dlq_sub.add_parser("replay", help="Replay a DLQ entry")
+    dlq_replay_parser.add_argument("id", help="Dead-letter task ID")
+    dlq_replay_parser.add_argument("--queue", help="Override queue when replaying")
 
     args = parser.parse_args()
 
@@ -79,6 +120,13 @@ async def main_async():
         await list_executions(executor, args)
     elif args.command == "show":
         await show_execution(executor, args)
+    elif args.command == "dlq":
+        if args.dlq_command == "list":
+            await dlq_list(executor, args)
+        elif args.dlq_command == "show":
+            await dlq_show(executor, args)
+        elif args.dlq_command == "replay":
+            await dlq_replay(executor, args)
 
 def main():
     asyncio.run(main_async())

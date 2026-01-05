@@ -306,6 +306,22 @@ Workers share the same backoff strategy through `poll_interval`, `poll_interval_
 
 > **Production tip:** Redis notifications are still the recommended way to unblock waiters in real time. Adaptive polling keeps database load under control when Redis is unavailable, but Pub/Sub provides the fastest and most efficient wake-ups.
 
+### Graceful Shutdown & Readiness
+
+Each worker run can expose a `WorkerLifecycle` handle so your process manager (systemd, Kubernetes, etc.) knows when it is safe to send traffic or terminate the pod:
+
+```python
+lifecycle = executor.create_worker_lifecycle(name="worker-1")
+worker = asyncio.create_task(executor.serve(lifecycle=lifecycle))
+await lifecycle.wait_until_ready()  # Report readiness probe success
+
+# Later on shutdown
+executor.request_worker_drain(lifecycle)
+await lifecycle.wait_until_stopped()
+```
+
+`executor.worker_status_overview()` returns a summary for all running lifecycles (`ready`/`draining`) so you can wire it directly into readiness/liveness endpoints.
+
 **Scaling:**
 Run multiple worker processes (or containers) pointing to the same database backend. They will automatically coordinate and distribute tasks.
 
@@ -328,6 +344,11 @@ senpuki list --state failed
 
 # Show details and progress of a specific execution
 senpuki show <execution_id>
+
+# Inspect the Dead Letter Queue
+senpuki dlq list
+senpuki dlq show <task_id>
+senpuki dlq replay <task_id> [--queue retry]
 ```
 
 **Configuration:**
@@ -353,6 +374,8 @@ instrument()
 executor = Senpuki(backend=...)
 ```
 
+If the OpenTelemetry SDK isn't installed, `instrument()` simply logs a warning and returns `False` so imports remain safe in minimal environments.
+
 ### Programmatic API
 
 You can also inspect state directly in your code:
@@ -373,7 +396,36 @@ pending_count = await executor.queue_depth(queue="default")
 
 # Inspect running activities
 running_tasks = await executor.get_running_activities()
+
+# Manage dead letters
+letters = await executor.list_dead_letters(limit=10)
+if letters:
+    await executor.replay_dead_letter(letters[0].id, queue="retry")
 ```
+
+### Structured Logging & Metrics
+
+Every log Senpuki emits now includes the current execution/task context via the `senpuki_execution_id`, `senpuki_task_id`, and `senpuki_worker_id` record attributes. Call `install_structured_logging()` if you want to add the filter to your own logger:
+
+```python
+import logging
+from senpuki import install_structured_logging
+
+install_structured_logging(logging.getLogger())  # root logger
+logging.basicConfig(format="%(levelname)s exec=%(senpuki_execution_id)s task=%(senpuki_task_id)s %(message)s")
+```
+
+You can also plug in a custom metrics backend via the constructor:
+
+```python
+class PromMetrics:
+    def task_completed(self, **labels): ...
+    def task_failed(self, **labels): ...
+
+executor = Senpuki(backend=backend, metrics=PromMetrics())
+```
+
+The recorder receives hooks for task claims, completions, retries, dead-letter moves, and lease renewals so you can export them to Prometheus/StatsD.
 
 ---
 

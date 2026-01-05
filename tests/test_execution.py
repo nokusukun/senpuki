@@ -3,6 +3,7 @@ import asyncio
 import os
 import shutil
 import contextlib
+import uuid
 from datetime import datetime, timedelta
 from senpuki import Senpuki, Result, RetryPolicy
 from senpuki.executor import UnregisteredFunctionError
@@ -61,6 +62,16 @@ async def guarded_long_activity(duration: float) -> int:
 
 async def registry_isolated_workflow(value: int) -> int:
     return value + 5
+
+DLQ_REPLAY_ATTEMPTS: dict[str, int] = {}
+
+@Senpuki.durable(retry_policy=RetryPolicy(max_attempts=1, initial_delay=0.01))
+async def flaky_once_task(key: str) -> str:
+    attempt = DLQ_REPLAY_ATTEMPTS.get(key, 0)
+    DLQ_REPLAY_ATTEMPTS[key] = attempt + 1
+    if attempt == 0:
+        raise RuntimeError("boom")
+    return f"ok-{attempt}"
 
 
 class TestExecution(unittest.IsolatedAsyncioTestCase):
@@ -159,6 +170,26 @@ class TestExecution(unittest.IsolatedAsyncioTestCase):
         tasks = await self.backend.list_tasks_for_execution(exec_id)
         root_task = next(t for t in tasks if t.kind == "orchestrator")
         self.assertEqual(root_task.retries, 2)
+
+    async def test_replay_dead_letter(self):
+        key = str(uuid.uuid4())
+        exec_id = await self.executor.dispatch(flaky_once_task, key)
+
+        while True:
+            state = await self.executor.state_of(exec_id)
+            if state.state in ("failed", "completed"):
+                break
+            await asyncio.sleep(0.05)
+
+        self.assertEqual(state.state, "failed")
+        letters = await self.executor.list_dead_letters()
+        self.assertEqual(len(letters), 1)
+        replayed_id = await self.executor.replay_dead_letter(letters[0].id)
+        self.assertNotEqual(replayed_id, letters[0].id)
+        result = await self.executor.wait_for(exec_id, expiry=5.0)
+        self.assertTrue(result.ok)
+        self.assertIn("ok-", result.value)
+        self.assertEqual(await self.executor.list_dead_letters(), [])
 
     async def test_queue_and_tags_filtering(self):
         # Stop default worker FIRST to prevent it from stealing tasks

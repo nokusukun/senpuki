@@ -5,7 +5,8 @@ import logging # Import logging
 from datetime import datetime, timedelta
 from typing import List, Optional, Any
 from senpuki.backend.base import Backend
-from senpuki.core import ExecutionRecord, TaskRecord, ExecutionProgress, RetryPolicy, SignalRecord
+from senpuki.core import ExecutionRecord, TaskRecord, ExecutionProgress, RetryPolicy, SignalRecord, DeadLetterRecord
+from senpuki.backend.utils import task_record_to_json, task_record_from_json
 
 logger = logging.getLogger(__name__)
 
@@ -485,11 +486,50 @@ class SQLiteBackend(Backend):
 
     async def move_task_to_dead_letter(self, task: TaskRecord, reason: str) -> None:
          async with aiosqlite.connect(self.db_path) as db:
+            payload = task_record_to_json(task)
             await db.execute(
                 "INSERT INTO dead_tasks (id, reason, moved_at, data) VALUES (?, ?, ?, ?)",
-                (task.id, reason, datetime.now(), str(task))
+                (task.id, reason, datetime.now(), payload)
             )
             await db.commit()
+
+    def _row_to_dead_letter(self, row: Any) -> DeadLetterRecord:
+        moved_at = row["moved_at"]
+        if isinstance(moved_at, str):
+            moved_at = datetime.fromisoformat(moved_at)
+        task = task_record_from_json(row["data"])
+        return DeadLetterRecord(task=task, reason=row["reason"], moved_at=moved_at)
+
+    async def list_dead_tasks(self, limit: int = 50) -> List[DeadLetterRecord]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM dead_tasks ORDER BY moved_at DESC LIMIT ?",
+                (limit,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [self._row_to_dead_letter(row) for row in rows]
+
+    async def get_dead_task(self, task_id: str) -> DeadLetterRecord | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM dead_tasks WHERE id = ?",
+                (task_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                if not row:
+                    return None
+                return self._row_to_dead_letter(row)
+
+    async def delete_dead_task(self, task_id: str) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "DELETE FROM dead_tasks WHERE id = ?",
+                (task_id,),
+            )
+            await db.commit()
+            return (cursor.rowcount or 0) > 0
 
     async def cleanup_executions(self, older_than: datetime) -> int:
         async with aiosqlite.connect(self.db_path) as db:

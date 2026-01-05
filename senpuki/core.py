@@ -115,6 +115,20 @@ class SignalRecord:
     consumed_at: datetime | None = None
 
 @dataclass
+class DeadLetterRecord:
+    task: TaskRecord
+    reason: str
+    moved_at: datetime
+
+    @property
+    def id(self) -> str:
+        return self.task.id
+
+    @property
+    def execution_id(self) -> str:
+        return self.task.execution_id
+
+@dataclass
 class ExecutionState:
     id: str
     state: str

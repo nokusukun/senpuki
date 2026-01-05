@@ -2,6 +2,7 @@ import unittest
 import asyncio
 import os
 import logging
+import contextlib
 from senpuki import Senpuki, Result, sleep
 from senpuki.executor import _original_sleep
 from tests.utils import get_test_backend, cleanup_test_backend, clear_test_backend
@@ -88,3 +89,22 @@ class TestHelpers(unittest.IsolatedAsyncioTestCase):
             await task
         except asyncio.CancelledError:
             pass
+
+    async def test_worker_lifecycle_drain_and_status(self):
+        # Stop default worker to avoid interference
+        self.worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self.worker_task
+
+        lifecycle = self.executor.create_worker_lifecycle(name="probe")
+        worker = asyncio.create_task(self.executor.serve(poll_interval=0.05, lifecycle=lifecycle))
+        await lifecycle.wait_until_ready()
+        status = self.executor.worker_status_overview()
+        self.assertTrue(status["ready"])
+        self.assertFalse(status["draining"])
+
+        self.executor.request_worker_drain(lifecycle)
+        await lifecycle.wait_until_stopped()
+        await worker
+        stopped_status = self.executor.worker_status_overview()
+        self.assertTrue(stopped_status["draining"] or not stopped_status["workers"])

@@ -4,7 +4,8 @@ import logging
 from datetime import datetime, timedelta
 from typing import List, Optional, Any
 from senpuki.backend.base import Backend
-from senpuki.core import ExecutionRecord, TaskRecord, ExecutionProgress, RetryPolicy, SignalRecord
+from senpuki.core import ExecutionRecord, TaskRecord, ExecutionProgress, RetryPolicy, SignalRecord, DeadLetterRecord
+from senpuki.backend.utils import task_record_to_json, task_record_from_json
 
 logger = logging.getLogger(__name__)
 
@@ -468,10 +469,45 @@ class PostgresBackend(Backend):
     async def move_task_to_dead_letter(self, task: TaskRecord, reason: str) -> None:
          assert self.pool is not None
          async with self.pool.acquire() as conn:
+            payload = task_record_to_json(task)
             await conn.execute(
                 "INSERT INTO dead_tasks (id, reason, moved_at, data) VALUES ($1, $2, $3, $4)",
-                task.id, reason, datetime.now(), str(task)
+                task.id, reason, datetime.now(), payload
             )
+
+    def _row_to_dead_letter(self, row: Any) -> DeadLetterRecord:
+        task = task_record_from_json(row["data"])
+        return DeadLetterRecord(task=task, reason=row["reason"], moved_at=row["moved_at"])
+
+    async def list_dead_tasks(self, limit: int = 50) -> List[DeadLetterRecord]:
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM dead_tasks ORDER BY moved_at DESC LIMIT $1",
+                limit,
+            )
+            return [self._row_to_dead_letter(row) for row in rows]
+
+    async def get_dead_task(self, task_id: str) -> DeadLetterRecord | None:
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM dead_tasks WHERE id = $1",
+                task_id,
+            )
+            if not row:
+                return None
+            return self._row_to_dead_letter(row)
+
+    async def delete_dead_task(self, task_id: str) -> bool:
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            tag = await conn.execute("DELETE FROM dead_tasks WHERE id = $1", task_id)
+            try:
+                count = int(tag.split(" ")[1])
+            except (IndexError, ValueError):
+                count = 0
+            return count > 0
 
     async def cleanup_executions(self, older_than: datetime) -> int:
         assert self.pool is not None

@@ -10,7 +10,7 @@ from contextvars import ContextVar
 
 from senpuki.core import (
     Result, RetryPolicy, ExecutionRecord, TaskRecord, ExecutionProgress, 
-    ExecutionState, compute_retry_delay, SignalRecord
+    ExecutionState, compute_retry_delay, SignalRecord, DeadLetterRecord
 )
 from senpuki.backend.base import Backend
 from senpuki.notifications.base import NotificationBackend
@@ -18,10 +18,32 @@ from senpuki.registry import registry, FunctionMetadata, FunctionRegistry
 from senpuki.utils.serialization import Serializer, JsonSerializer
 from senpuki.utils.idempotency import default_idempotency_key
 from senpuki.utils.time import parse_duration
+from senpuki.metrics import MetricsRecorder, NoOpMetricsRecorder
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 
 logger = logging.getLogger(__name__)
+
+class SenpukiLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.senpuki_execution_id = current_execution_id.get()
+        record.senpuki_task_id = current_task_id.get()
+        record.senpuki_worker_id = current_worker_id.get()
+        return True
+
+def install_structured_logging(target: logging.Logger | None = None) -> None:
+    """
+    Adds a logging.Filter that injects Senpuki context (execution/task id) into
+    every log record. Integrate it with your formatter via
+    %(senpuki_execution_id)s etc.
+    """
+    logger_obj = target or logging.getLogger("senpuki")
+    for existing in getattr(logger_obj, "filters", []):
+        if isinstance(existing, SenpukiLogFilter):
+            return
+    logger_obj.addFilter(SenpukiLogFilter())
+
+install_structured_logging(logger)
 
 class ExpiryError(TimeoutError):
     pass
@@ -51,6 +73,51 @@ class PermitHolder:
         if not self.held:
             await self.sem.acquire()
             self.held = True
+
+@dataclass(eq=False)
+class WorkerLifecycle:
+    """
+    Represents the lifecycle of a long-running worker loop. Callers can use it
+    to coordinate readiness / draining with their process manager (e.g. K8s).
+    """
+    name: str | None = None
+    ready_event: asyncio.Event = field(default_factory=asyncio.Event)
+    draining_event: asyncio.Event = field(default_factory=asyncio.Event)
+    stopped_event: asyncio.Event = field(default_factory=asyncio.Event)
+    stop_event: asyncio.Event = field(default_factory=asyncio.Event)
+    state: Literal["starting", "ready", "draining", "stopped"] = "starting"
+
+    def __hash__(self) -> int:
+        return id(self)
+
+    def reset(self) -> None:
+        self.ready_event.clear()
+        self.draining_event.clear()
+        self.stopped_event.clear()
+        self.stop_event.clear()
+        self.state = "starting"
+
+    def mark_ready(self) -> None:
+        self.state = "ready"
+        self.ready_event.set()
+
+    def mark_draining(self) -> None:
+        if self.state != "draining":
+            self.state = "draining"
+            self.draining_event.set()
+
+    def mark_stopped(self) -> None:
+        self.state = "stopped"
+        self.stopped_event.set()
+
+    def request_drain(self) -> None:
+        self.stop_event.set()
+
+    async def wait_until_ready(self) -> None:
+        await self.ready_event.wait()
+
+    async def wait_until_stopped(self) -> None:
+        await self.stopped_event.wait()
 
 # Backends helper
 class Backends:
@@ -82,6 +149,7 @@ current_execution_id: ContextVar[str | None] = ContextVar("senpuki_execution_id"
 current_task_id: ContextVar[str | None] = ContextVar("senpuki_task_id", default=None)
 current_worker_semaphore: ContextVar[asyncio.Semaphore | None] = ContextVar("senpuki_worker_semaphore", default=None)
 current_permit_holder: ContextVar[PermitHolder | None] = ContextVar("senpuki_permit_holder", default=None)
+current_worker_id: ContextVar[str | None] = ContextVar("senpuki_worker_id", default=None)
 
 class Senpuki:
     backends = Backends
@@ -97,6 +165,7 @@ class Senpuki:
         poll_max_interval: float = 5.0,
         poll_backoff_factor: float = 2.0,
         function_registry: FunctionRegistry | None = None,
+        metrics: MetricsRecorder | None = None,
     ):
         self.backend = backend
         self.registry = function_registry or self.default_registry
@@ -116,10 +185,13 @@ class Senpuki:
         self.poll_min_interval = max(0.001, poll_min_interval)
         self.poll_max_interval = max(self.poll_min_interval, poll_max_interval)
         self.poll_backoff_factor = poll_backoff_factor if poll_backoff_factor >= 1.0 else 1.0
+        self.metrics: MetricsRecorder = metrics or NoOpMetricsRecorder()
         
         # Tracks background asyncio.Task instances spawned by this executor so their
         # lifecycle can be managed (for example, awaiting or cleanup on shutdown).
         self.background_tasks: set[asyncio.Task[Any]] = set()
+        self._active_worker_lifecycles: set[WorkerLifecycle] = set()
+        self._default_worker_lifecycle: WorkerLifecycle | None = None
         
         self._register_builtin_tasks()
 
@@ -143,6 +215,49 @@ class Senpuki:
             version="1.0"
         )
         self.registry.register(meta)
+
+    def create_worker_lifecycle(self, *, name: str | None = None) -> WorkerLifecycle:
+        """
+        Returns a WorkerLifecycle handle that can be passed into serve() so the
+        caller can coordinate readiness / draining signals with their host.
+        """
+        return WorkerLifecycle(name=name)
+
+    def active_worker_lifecycles(self) -> List[WorkerLifecycle]:
+        return list(self._active_worker_lifecycles)
+
+    def worker_status_overview(self) -> dict[str, Any]:
+        """
+        Returns a summary that external health checks can expose.
+        """
+        handles = self.active_worker_lifecycles()
+        ready = any(h.state in ("ready", "draining") and h.ready_event.is_set() for h in handles)
+        draining = any(h.state == "draining" for h in handles)
+        return {
+            "ready": ready,
+            "draining": draining,
+            "workers": [
+                {
+                    "name": handle.name or f"worker-{idx}",
+                    "state": handle.state,
+                }
+                for idx, handle in enumerate(handles)
+            ],
+        }
+
+    def request_worker_drain(self, lifecycle: WorkerLifecycle | None = None) -> None:
+        """
+        Signals all active workers (or a specific lifecycle) to stop accepting
+        new work while letting in-flight tasks finish.
+        """
+        if lifecycle:
+            lifecycle.request_drain()
+            return
+
+        for handle in list(self._active_worker_lifecycles):
+            handle.request_drain()
+        if not self._active_worker_lifecycles and self._default_worker_lifecycle:
+            self._default_worker_lifecycle.request_drain()
 
     async def schedule(
         self, 
@@ -901,6 +1016,64 @@ class Senpuki:
         """
         return await self.backend.list_tasks(limit=100, state="running")
 
+    async def list_dead_letters(self, limit: int = 50) -> List[DeadLetterRecord]:
+        """
+        Returns the most recent dead-lettered tasks.
+        """
+        return await self.backend.list_dead_tasks(limit=limit)
+
+    async def get_dead_letter(self, task_id: str) -> DeadLetterRecord | None:
+        return await self.backend.get_dead_task(task_id)
+
+    async def discard_dead_letter(self, task_id: str) -> bool:
+        return await self.backend.delete_dead_task(task_id)
+
+    async def replay_dead_letter(
+        self,
+        task_id: str,
+        *,
+        queue: str | None = None,
+        reset_retries: bool = True,
+    ) -> str:
+        """
+        Re-enqueues a dead-lettered task with a fresh task ID so it can run again.
+        """
+        record = await self.get_dead_letter(task_id)
+        if not record:
+            raise ValueError(f"Dead-letter task {task_id} not found")
+
+        new_task = replace(record.task)
+        original_id = new_task.id
+        new_task.id = str(uuid.uuid4())
+        new_task.state = "pending"
+        new_task.worker_id = None
+        new_task.lease_expires_at = None
+        new_task.started_at = None
+        new_task.completed_at = None
+        new_task.result = None
+        new_task.error = None
+        new_task.created_at = datetime.now()
+        if reset_retries:
+            new_task.retries = 0
+        if queue is not None:
+            new_task.queue = queue
+
+        await self.backend.create_task(new_task)
+        await self.backend.delete_dead_task(original_id)
+
+        if record.task.kind == "orchestrator":
+            execution = await self.backend.get_execution(new_task.execution_id)
+            if execution:
+                execution.state = "pending"
+                execution.started_at = None
+                execution.completed_at = None
+                execution.result = None
+                execution.error = None
+                execution.retries = 0
+                await self.backend.update_execution(execution)
+
+        return new_task.id
+
     async def serve(
         self,
         *,
@@ -915,9 +1088,17 @@ class Senpuki:
         poll_backoff_factor: float | None = None,
         cleanup_interval: float | None = 3600.0, # Default 1 hour
         retention_period: timedelta = timedelta(days=7),
+        lifecycle: WorkerLifecycle | None = None,
     ):
         if not worker_id:
             worker_id = str(uuid.uuid4())
+
+        lifecycle_handle = lifecycle or self.create_worker_lifecycle(name=worker_id)
+        if lifecycle is None:
+            self._default_worker_lifecycle = lifecycle_handle
+        lifecycle_handle.reset()
+        self._active_worker_lifecycles.add(lifecycle_handle)
+        worker_tasks: set[asyncio.Task[Any]] = set()
 
         if heartbeat_interval is None and lease_duration > timedelta(0):
             heartbeat_interval = lease_duration / 2
@@ -938,6 +1119,7 @@ class Senpuki:
 
         sem = asyncio.Semaphore(max_concurrency)
         logger.info(f"Worker {worker_id} started. Queues: {queues}")
+        lifecycle_handle.mark_ready()
         
         cleanup_task = None
         if cleanup_interval is not None:
@@ -945,11 +1127,22 @@ class Senpuki:
 
         try:
             while True:
+                if lifecycle_handle.stop_event.is_set():
+                    lifecycle_handle.mark_draining()
+                    if worker_tasks:
+                        await asyncio.wait(worker_tasks, return_when=asyncio.FIRST_COMPLETED)
+                        continue
+                    break
+
                 # Check if we can acquire
                 # We don't want to block here, just check if sem is full
                 # But asyncio.Semaphore doesn't have a check without acquire. 
                 # We acquire first, then claim.
                 await sem.acquire()
+                if lifecycle_handle.stop_event.is_set():
+                    lifecycle_handle.mark_draining()
+                    sem.release()
+                    continue
 
                 # Collect concurrency limits
                 concurrency_limits = {}
@@ -969,12 +1162,15 @@ class Senpuki:
                     
                     if task:
                         # logger.info(f"Worker claimed task {task.step_name} ({task.id})")
+                        self.metrics.task_claimed(queue=task.queue, step_name=task.step_name, kind=task.kind)
                         # Run in background
                         bg_task = asyncio.create_task(
                             self._handle_task(task, worker_id, lease_duration, heartbeat_interval, sem)
                         )
                         self.background_tasks.add(bg_task)
+                        worker_tasks.add(bg_task)
                         bg_task.add_done_callback(self.background_tasks.discard)
+                        bg_task.add_done_callback(worker_tasks.discard)
                         current_poll_delay = worker_poll_min
                     else:
                         sem.release()
@@ -999,6 +1195,8 @@ class Senpuki:
                     await cleanup_task
                 except asyncio.CancelledError:
                     pass
+            lifecycle_handle.mark_stopped()
+            self._active_worker_lifecycles.discard(lifecycle_handle)
 
     async def shutdown(self):
         """
@@ -1045,8 +1243,10 @@ class Senpuki:
                     renewed = await self.backend.renew_task_lease(task_id, worker_id, lease_duration)
                 except Exception:
                     logger.exception("Lease renewal failed for task %s", task_id)
+                    self.metrics.lease_renewed(task_id=task_id, success=False)
                     return
 
+                self.metrics.lease_renewed(task_id=task_id, success=renewed)
                 if not renewed:
                     logger.warning(
                         "Lease renewal lost for task %s on worker %s; allowing reclaim",
@@ -1071,6 +1271,7 @@ class Senpuki:
         token_executor = current_executor.set(self)
         token_sem = current_worker_semaphore.set(sem)
         token_permit = current_permit_holder.set(PermitHolder(sem))
+        token_worker = current_worker_id.set(worker_id)
         
         execution = None
         heartbeat_task: asyncio.Task | None = None
@@ -1204,6 +1405,16 @@ class Senpuki:
                  await self.backend.set_cached_result(key, task.result)
                  logger.debug(f"Cached result for orchestrator {meta.name} with key {key}")
 
+            duration_s = 0.0
+            if task.started_at and task.completed_at:
+                duration_s = (task.completed_at - task.started_at).total_seconds()
+            self.metrics.task_completed(
+                queue=task.queue,
+                step_name=task.step_name,
+                kind=task.kind,
+                duration_s=duration_s,
+            )
+
         except Exception as e:
             # Retry logic
             retry_policy = task.retry_policy or RetryPolicy()
@@ -1223,6 +1434,13 @@ class Senpuki:
                 await self.backend.append_progress(task.execution_id, ExecutionProgress(
                      step=task.step_name, status="failed", detail=str(e)
                 ))
+                self.metrics.task_failed(
+                    queue=task.queue,
+                    step_name=task.step_name,
+                    kind=task.kind,
+                    reason=str(e),
+                    retrying=True,
+                )
             else:
                 # Fatal failure
                 task.state = "failed"
@@ -1233,6 +1451,19 @@ class Senpuki:
                 await self.backend.append_progress(task.execution_id, ExecutionProgress(
                      step=task.step_name, status="failed", detail=str(e)
                 ))
+                self.metrics.task_failed(
+                    queue=task.queue,
+                    step_name=task.step_name,
+                    kind=task.kind,
+                    reason=str(e),
+                    retrying=False,
+                )
+                self.metrics.dead_lettered(
+                    queue=task.queue,
+                    step_name=task.step_name,
+                    kind=task.kind,
+                    reason=str(e),
+                )
                 if not execution: # pyrefly: ignore
                     raise ValueError(f"Execution {task.execution_id} not found")
 
@@ -1260,6 +1491,7 @@ class Senpuki:
             current_executor.reset(token_executor)
             current_worker_semaphore.reset(token_sem)
             current_permit_holder.reset(token_permit)
+            current_worker_id.reset(token_worker)
             # logger.info(f"DEBUG: Finished _handle_task for {task.step_name} ({task.id})")
 
 # Context var for executor instance

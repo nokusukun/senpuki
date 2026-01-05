@@ -1,6 +1,9 @@
 from typing import Optional
 import functools
+import logging
 from senpuki import Senpuki
+
+logger = logging.getLogger(__name__)
 
 try:
     from opentelemetry import trace
@@ -9,16 +12,19 @@ try:
 except ImportError:
     _HAS_OTEL = False
 
-def instrument(tracer_provider=None):
+def instrument(tracer_provider=None) -> bool:
     """
     Instruments the Senpuki library with OpenTelemetry.
+    Returns True if instrumentation was installed, False otherwise.
     """
     if not _HAS_OTEL:
-        raise ImportError("opentelemetry-api is not installed. Please install it to use instrumentation.")
+        logger.warning("OpenTelemetry not installed; skipping Senpuki instrumentation.")
+        return False
 
     tracer = trace.get_tracer("senpuki", tracer_provider=tracer_provider)
     
     _instrument_executor(tracer)
+    return True
 
 def _instrument_executor(tracer):
     # Idempotency check
