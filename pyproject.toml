@@ -15,6 +15,9 @@ dependencies = [
     "redis>=7.1.0",
 ]
 
+[project.scripts]
+senpuki = "senpuki.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/nokusukun/senpuki"
 Issues = "https://github.com/nokusukun/senpuki/issues"
