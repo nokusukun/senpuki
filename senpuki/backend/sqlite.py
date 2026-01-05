@@ -5,7 +5,7 @@ import logging # Import logging
 from datetime import datetime, timedelta
 from typing import List, Optional, Any
 from senpuki.backend.base import Backend
-from senpuki.core import ExecutionRecord, TaskRecord, ExecutionProgress, RetryPolicy
+from senpuki.core import ExecutionRecord, TaskRecord, ExecutionProgress, RetryPolicy, SignalRecord
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +25,17 @@ class SQLiteBackend(Backend):
 
     async def init_db(self):
         async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS signals (
+                    execution_id TEXT,
+                    name TEXT,
+                    payload BLOB,
+                    created_at TIMESTAMP,
+                    consumed BOOLEAN,
+                    consumed_at TIMESTAMP,
+                    PRIMARY KEY (execution_id, name)
+                )
+            """)
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS executions (
                     id TEXT PRIMARY KEY,
@@ -289,6 +300,7 @@ class SQLiteBackend(Backend):
                     OR (state='running' AND lease_expires_at < ?)
                 )
                 AND (scheduled_for IS NULL OR scheduled_for <= ?)
+                AND kind != 'signal'
                 {queue_clause}
                 ORDER BY priority DESC, created_at ASC
                 LIMIT 50
@@ -418,12 +430,38 @@ class SQLiteBackend(Backend):
             # Delete dependents using subquery
             await db.execute(f"DELETE FROM tasks WHERE execution_id IN (SELECT id FROM executions WHERE {where_clause})", (older_than,))
             await db.execute(f"DELETE FROM execution_progress WHERE execution_id IN (SELECT id FROM executions WHERE {where_clause})", (older_than,))
+            await db.execute(f"DELETE FROM signals WHERE execution_id IN (SELECT id FROM executions WHERE {where_clause})", (older_than,))
             
             # Delete executions
             async with db.execute(f"DELETE FROM executions WHERE {where_clause}", (older_than,)) as cursor:
                 count = cursor.rowcount
             await db.commit()
             return count
+
+    async def create_signal(self, signal: SignalRecord) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO signals (execution_id, name, payload, created_at, consumed, consumed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (signal.execution_id, signal.name, signal.payload, signal.created_at, signal.consumed, signal.consumed_at)
+            )
+            await db.commit()
+
+    async def get_signal(self, execution_id: str, name: str) -> SignalRecord | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM signals WHERE execution_id = ? AND name = ?", (execution_id, name)) as cursor:
+                row = await cursor.fetchone()
+                if not row:
+                    return None
+                return SignalRecord(
+                    execution_id=row["execution_id"],
+                    name=row["name"],
+                    payload=row["payload"],
+                    created_at=datetime.fromisoformat(row["created_at"]) if isinstance(row["created_at"], str) else row["created_at"],
+                    consumed=bool(row["consumed"]),
+                    consumed_at=datetime.fromisoformat(row["consumed_at"]) if row["consumed_at"] and isinstance(row["consumed_at"], str) else row["consumed_at"]
+                )
+
 
     def _progress_to_dict(self, p: ExecutionProgress) -> dict:
         return {

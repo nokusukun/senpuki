@@ -43,8 +43,8 @@ This document tracks planned improvements, feature requests, and architectural c
     - `senpuki_tasks_failed_total`
     - `senpuki_queue_depth`
     - `senpuki_e2e_latency_seconds`
-- [ ] **OpenTelemetry Tracing:** Instrument the executor to emit spans for each task/workflow, linking distributed traces across services.
-- [ ] **CLI Tool:** A `senpuki` CLI for common ops:
+- [*] **OpenTelemetry Tracing:** Instrument the executor to emit spans for each task/workflow, linking distributed traces across services.
+- [*] **CLI Tool:** A `senpuki` CLI for common ops:
     - `senpuki list`
     - `senpuki show <id>`
     - `senpuki cancel <id>`

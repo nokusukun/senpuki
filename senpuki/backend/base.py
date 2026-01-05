@@ -1,6 +1,6 @@
 from typing import Protocol, List, Optional
 from datetime import datetime, timedelta
-from senpuki.core import ExecutionRecord, TaskRecord, ExecutionProgress
+from senpuki.core import ExecutionRecord, TaskRecord, ExecutionProgress, SignalRecord
 
 class Backend(Protocol):
     async def init_db(self) -> None: ...
@@ -53,3 +53,8 @@ class Backend(Protocol):
     ) -> None: ...
 
     async def cleanup_executions(self, older_than: datetime) -> int: ...
+
+    # signals
+    async def create_signal(self, signal: SignalRecord) -> None: ...
+    async def get_signal(self, execution_id: str, name: str) -> SignalRecord | None: ...
+

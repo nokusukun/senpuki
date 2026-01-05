@@ -276,7 +276,49 @@ Run multiple worker processes (or containers) pointing to the same database back
 
 ## Monitoring & Management
 
-Senpuki provides APIs to inspect and manage executions.
+Senpuki provides multiple ways to inspect and manage executions: Programmatic API, CLI, and OpenTelemetry integration.
+
+### Command Line Interface (CLI)
+
+Senpuki comes with a built-in CLI to manage workflows.
+
+```bash
+# List recent executions
+senpuki list
+
+# List failed executions
+senpuki list --state failed
+
+# Show details and progress of a specific execution
+senpuki show <execution_id>
+```
+
+**Configuration:**
+The CLI connects to `senpuki.sqlite` by default. You can specify a different database (SQLite path or Postgres DSN) via the `--db` flag or `SENPUKI_DB` environment variable.
+
+```bash
+export SENPUKI_DB="postgresql://user:pass@localhost/senpuki"
+senpuki list
+```
+
+### OpenTelemetry Instrumentation
+
+You can instrument Senpuki to emit distributed traces for your workflows (compatible with Jaeger, Honeycomb, Datadog, etc.).
+
+```python
+from senpuki import Senpuki
+from senpuki.telemetry import instrument
+
+# Auto-instrument Senpuki
+# This will emit spans for 'senpuki.dispatch' and 'senpuki.execute'
+instrument()
+
+executor = Senpuki(backend=...)
+```
+
+### Programmatic API
+
+You can also inspect state directly in your code:
 
 ```python
 # Check status

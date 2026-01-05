@@ -9,7 +9,7 @@ from contextvars import ContextVar
 
 from senpuki.core import (
     Result, RetryPolicy, ExecutionRecord, TaskRecord, ExecutionProgress, 
-    ExecutionState, compute_retry_delay
+    ExecutionState, compute_retry_delay, SignalRecord
 )
 from senpuki.backend.base import Backend
 from senpuki.notifications.base import NotificationBackend
@@ -583,9 +583,161 @@ class Senpuki:
         
         return execution_id
 
+    async def send_signal(self, execution_id: str, name: str, payload: Any) -> None:
+        """
+        Send a signal to a running execution. 
+        If the execution is waiting for this signal, it will be resumed.
+        If not, the signal will be buffered.
+        """
+        # 1. Store signal
+        payload_bytes = self.serializer.dumps(payload)
+        signal = SignalRecord(
+            execution_id=execution_id,
+            name=name,
+            payload=payload_bytes,
+            created_at=datetime.now(),
+            consumed=False
+        )
+        await self.backend.create_signal(signal)
+        
+        # 2. Wake up pending task if any
+        # We use a deterministic task ID for signals: uuid5(exec_id + name)
+        # But to be safe, let's just query the tasks or construct the ID if we define the generation rule.
+        # Let's check if the specific waiter task exists.
+        
+        # To avoid dependency on uuid namespacing details, let's just search.
+        # Optimization: We can search for tasks with step_name=f"signal:{name}"
+        # But backend doesn't support search by step_name.
+        # So we iterate.
+        tasks = await self.backend.list_tasks_for_execution(execution_id)
+        target_step = f"signal:{name}"
+        
+        for t in tasks:
+            if t.step_name == target_step and t.kind == "signal" and t.state == "pending":
+                # Mark as completed
+                t.state = "completed"
+                t.result = payload_bytes
+                t.completed_at = datetime.now()
+                await self.backend.update_task(t)
+                
+                # Notify
+                if self.notification_backend:
+                     await self.notification_backend.notify_task_completed(t.id)
+                break
+
+    @staticmethod
+    async def wait_for_signal(name: str) -> Any:
+        """
+        Static helper to wait for a signal.
+        Proxies to the global executor context.
+        """
+        executor = current_executor.get()
+        if not executor:
+             raise Exception("Cannot wait for signal outside of durable function")
+        return await executor.wait_for_signal_instance(name)
+
+    async def wait_for_signal_instance(self, name: str) -> Any:
+        """
+        Pauses the current workflow until a signal with the given name is received.
+        """
+        exec_id = current_execution_id.get()
+        if not exec_id:
+             raise Exception("Cannot wait for signal outside of durable function")
+             
+        step_name = f"signal:{name}"
+        
+        # Generate deterministic ID for the signal task to ensure idempotency on replay
+        # We use a constructed UUID based on exec_id and signal name
+        # exec_id is a UUID string.
+        try:
+             exec_uuid = uuid.UUID(exec_id)
+        except ValueError:
+             # Fallback if exec_id is not uuid (e.g. testing)
+             exec_uuid = uuid.uuid4() 
+             
+        task_id = str(uuid.uuid5(exec_uuid, step_name))
+        
+        # 1. Check if we already have this task (replay or already running)
+        existing_task = await self.backend.get_task(task_id)
+        if existing_task:
+            if existing_task.state == "completed":
+                return self.serializer.loads(existing_task.result) # pyrefly: ignore
+            else:
+                # Still pending, wait for it
+                completed = await self._wait_for_task(task_id)
+                return self.serializer.loads(completed.result) # pyrefly: ignore
+                
+        # 2. Check signal buffer
+        signal = await self.backend.get_signal(exec_id, name)
+        if signal and not signal.consumed:
+            # Consumed from buffer immediately
+            signal.consumed = True
+            signal.consumed_at = datetime.now()
+            await self.backend.create_signal(signal) # upsert
+            
+            # Create completed task
+            task = TaskRecord(
+                 id=task_id,
+                 execution_id=exec_id,
+                 step_name=step_name,
+                 kind="signal",
+                 parent_task_id=current_task_id.get(),
+                 state="completed",
+                 args=b"",
+                 kwargs=b"",
+                 retries=0,
+                 created_at=datetime.now(),
+                 completed_at=datetime.now(),
+                 tags=["signal"],
+                 priority=0,
+                 queue=None,
+                 retry_policy=None,
+                 result=signal.payload
+            )
+            await self.backend.create_task(task)
+            await self.backend.append_progress(exec_id, ExecutionProgress(
+                step=step_name, status="completed", detail="Signal consumed from buffer"
+            ))
+            return self.serializer.loads(signal.payload)
+            
+        # 3. Create pending task and wait
+        task = TaskRecord(
+             id=task_id,
+             execution_id=exec_id,
+             step_name=step_name,
+             kind="signal",
+             parent_task_id=current_task_id.get(),
+             state="pending",
+             args=b"",
+             kwargs=b"",
+             retries=0,
+             created_at=datetime.now(),
+             tags=["signal"],
+             priority=0,
+             queue=None,
+             retry_policy=None
+        )
+        await self.backend.create_task(task)
+        await self.backend.append_progress(exec_id, ExecutionProgress(
+            step=step_name, status="dispatched", detail="Waiting for signal"
+        ))
+        
+        # Wait
+        completed = await self._wait_for_task(task_id)
+        
+        # Mark signal consumed if it exists now
+        s = await self.backend.get_signal(exec_id, name)
+        if s and not s.consumed:
+             s.consumed = True
+             s.consumed_at = datetime.now()
+             await self.backend.create_signal(s)
+             
+        return self.serializer.loads(completed.result) # pyrefly: ignore
+
     async def _schedule_activity(
         self, 
         meta: FunctionMetadata, 
+
         args: tuple, 
         kwargs: dict, 
         idempotency_key: str | None,

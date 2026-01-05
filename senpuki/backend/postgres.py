@@ -4,7 +4,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import List, Optional, Any
 from senpuki.backend.base import Backend
-from senpuki.core import ExecutionRecord, TaskRecord, ExecutionProgress, RetryPolicy
+from senpuki.core import ExecutionRecord, TaskRecord, ExecutionProgress, RetryPolicy, SignalRecord
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +20,17 @@ class PostgresBackend(Backend):
         assert self.pool is not None
         
         async with self.pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS signals (
+                    execution_id TEXT,
+                    name TEXT,
+                    payload BYTEA,
+                    created_at TIMESTAMP,
+                    consumed BOOLEAN,
+                    consumed_at TIMESTAMP,
+                    PRIMARY KEY (execution_id, name)
+                )
+            """)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS executions (
                     id TEXT PRIMARY KEY,
@@ -278,6 +289,7 @@ class PostgresBackend(Backend):
                         OR (state='running' AND lease_expires_at < $1)
                     )
                     AND (scheduled_for IS NULL OR scheduled_for <= $2)
+                    AND kind != 'signal'
                     {queue_clause}
                     ORDER BY priority DESC, created_at ASC
                     LIMIT 50
@@ -389,6 +401,7 @@ class PostgresBackend(Backend):
                 # Delete dependents using subquery
                 await conn.execute(f"DELETE FROM tasks WHERE execution_id IN (SELECT id FROM executions WHERE {where_clause})", older_than)
                 await conn.execute(f"DELETE FROM execution_progress WHERE execution_id IN (SELECT id FROM executions WHERE {where_clause})", older_than)
+                await conn.execute(f"DELETE FROM signals WHERE execution_id IN (SELECT id FROM executions WHERE {where_clause})", older_than)
                 
                 # Delete executions
                 tag = await conn.execute(f"DELETE FROM executions WHERE {where_clause}", older_than)
@@ -398,6 +411,30 @@ class PostgresBackend(Backend):
                 except (IndexError, ValueError):
                     count = 0
                 return count
+
+    async def create_signal(self, signal: SignalRecord) -> None:
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO signals (execution_id, name, payload, created_at, consumed, consumed_at) VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (execution_id, name) DO UPDATE SET payload=$3, consumed=$5, consumed_at=$6
+            """, signal.execution_id, signal.name, signal.payload, signal.created_at, signal.consumed, signal.consumed_at)
+
+    async def get_signal(self, execution_id: str, name: str) -> SignalRecord | None:
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM signals WHERE execution_id = $1 AND name = $2", execution_id, name)
+            if not row:
+                return None
+            return SignalRecord(
+                execution_id=row["execution_id"],
+                name=row["name"],
+                payload=row["payload"],
+                created_at=row["created_at"],
+                consumed=row["consumed"],
+                consumed_at=row["consumed_at"]
+            )
+
 
     def _policy_to_json(self, p: RetryPolicy | None) -> str:
         if not p:

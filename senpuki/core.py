@@ -85,7 +85,7 @@ class TaskRecord:
     id: str
     execution_id: str
     step_name: str
-    kind: Literal["orchestrator", "activity"]
+    kind: Literal["orchestrator", "activity", "signal"]
     parent_task_id: str | None
     state: Literal["pending", "running", "completed", "failed"]
     args: bytes
@@ -104,6 +104,15 @@ class TaskRecord:
     lease_expires_at: datetime | None = None
     idempotency_key: str | None = None
     scheduled_for: datetime | None = None
+
+@dataclass
+class SignalRecord:
+    execution_id: str
+    name: str
+    payload: bytes
+    created_at: datetime
+    consumed: bool = False
+    consumed_at: datetime | None = None
 
 @dataclass
 class ExecutionState:
