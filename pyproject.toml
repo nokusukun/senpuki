@@ -26,8 +26,8 @@ Issues = "https://github.com/nokusukun/senpuki/issues"
 dev = [
     "pyrefly>=0.43.1",
     "pytest>=9.0.1",
+    "pytest-asyncio>=1.3.0",
 ]
 
 [tool.setuptools.packages.find]
 exclude = ["features"]
-

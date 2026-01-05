@@ -93,6 +93,10 @@ class SQLiteBackend(Backend):
                     scheduled_for TIMESTAMP
                 )
             """)
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_tasks_state_queue_scheduled ON tasks(state, queue, scheduled_for)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_tasks_priority_created ON tasks(priority, created_at)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_tasks_execution ON tasks(execution_id)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_tasks_step_lease ON tasks(step_name, state, lease_expires_at)")
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS dead_tasks (
                     id TEXT PRIMARY KEY,
@@ -116,23 +120,83 @@ class SQLiteBackend(Backend):
             """)
             await db.commit()
 
+    def _execution_row_values(self, record: ExecutionRecord) -> tuple[Any, ...]:
+        return (
+            record.id,
+            record.root_function,
+            record.state,
+            record.args,
+            record.kwargs,
+            record.result,
+            record.error,
+            record.retries,
+            record.created_at,
+            record.started_at,
+            record.completed_at,
+            record.expiry_at,
+            json.dumps(record.tags),
+            record.priority,
+            record.queue,
+        )
+
+    async def _insert_execution(self, db: aiosqlite.Connection, record: ExecutionRecord) -> None:
+        await db.execute(
+            "INSERT INTO executions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            self._execution_row_values(record),
+        )
+        for p in record.progress:
+            await db.execute(
+                "INSERT INTO execution_progress (execution_id, step, status, started_at, completed_at, detail) VALUES (?, ?, ?, ?, ?, ?)",
+                (record.id, p.step, p.status, p.started_at, p.completed_at, p.detail),
+            )
+
+    def _task_row_values(self, task: TaskRecord) -> tuple[Any, ...]:
+        return (
+            task.id,
+            task.execution_id,
+            task.step_name,
+            task.kind,
+            task.parent_task_id,
+            task.state,
+            task.args,
+            task.kwargs,
+            task.result,
+            task.error,
+            task.retries,
+            task.created_at,
+            task.started_at,
+            task.completed_at,
+            task.worker_id,
+            task.lease_expires_at,
+            json.dumps(task.tags),
+            task.priority,
+            task.queue,
+            task.idempotency_key,
+            self._policy_to_json(task.retry_policy),
+            task.scheduled_for,
+        )
+
+    async def _insert_task(self, db: aiosqlite.Connection, task: TaskRecord) -> None:
+        await db.execute(
+            "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            self._task_row_values(task),
+        )
+
     async def create_execution(self, record: ExecutionRecord) -> None:
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "INSERT INTO executions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    record.id, record.root_function, record.state, record.args, record.kwargs,
-                    record.result, record.error, record.retries, record.created_at,
-                    record.started_at, record.completed_at, record.expiry_at,
-                    json.dumps(record.tags), record.priority, record.queue
-                )
-            )
-            for p in record.progress:
-                await db.execute(
-                    "INSERT INTO execution_progress (execution_id, step, status, started_at, completed_at, detail) VALUES (?, ?, ?, ?, ?, ?)",
-                    (record.id, p.step, p.status, p.started_at, p.completed_at, p.detail)
-                )
+            await self._insert_execution(db, record)
             await db.commit()
+
+    async def create_execution_with_root_task(self, record: ExecutionRecord, task: TaskRecord) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                await self._insert_execution(db, record)
+                await self._insert_task(db, task)
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
 
     async def get_execution(self, execution_id: str) -> ExecutionRecord | None:
         async with aiosqlite.connect(self.db_path) as db:
@@ -196,15 +260,7 @@ class SQLiteBackend(Backend):
         async with aiosqlite.connect(self.db_path) as db:
             await db.executemany(
                 "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [
-                    (
-                        task.id, task.execution_id, task.step_name, task.kind, task.parent_task_id,
-                        task.state, task.args, task.kwargs, task.result, task.error, task.retries,
-                        task.created_at, task.started_at, task.completed_at, task.worker_id,
-                        task.lease_expires_at, json.dumps(task.tags), task.priority, task.queue,
-                        task.idempotency_key, self._policy_to_json(task.retry_policy), task.scheduled_for
-                    ) for task in tasks
-                ]
+                [self._task_row_values(task) for task in tasks],
             )
             await db.commit()
 
@@ -290,75 +346,68 @@ class SQLiteBackend(Backend):
 
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
-            
-            # 1. Fetch candidates (fetch more than 1 to handle filtered ones)
-            # We want pending tasks or running tasks with expired lease
-            query = f"""
-                SELECT * FROM tasks
-                WHERE (
-                    state='pending'
-                    OR (state='running' AND lease_expires_at < ?)
-                )
-                AND (scheduled_for IS NULL OR scheduled_for <= ?)
-                AND kind != 'signal'
-                {queue_clause}
-                ORDER BY priority DESC, created_at ASC
-                LIMIT 50
-            """
-            
-            async with db.execute(query, tuple(params)) as cursor:
-                candidates = await cursor.fetchall()
-            
-            if not candidates:
-                return None
-
-            # 2. Iterate and check limits
-            for row in candidates:
-                step_name = row["step_name"]
-                limit = concurrency_limits.get(step_name) if concurrency_limits else None
-                
-                if limit is not None:
-                    # Check current running count for this function
-                    # We consider 'running' tasks that have NOT expired their lease
-                    count_query = """
-                        SELECT COUNT(*) FROM tasks 
-                        WHERE step_name = ? 
-                        AND state = 'running' 
-                        AND lease_expires_at > ?
-                    """
-                    async with db.execute(count_query, (step_name, now)) as count_cursor:
-                        count_row = await count_cursor.fetchone()
-                        current_count = count_row[0] if count_row else 0
-                    
-                    if current_count >= limit:
-                        continue # Skip this task, limit reached
-
-                # 3. Attempt to claim
-                # Optimistic locking: ensure it's still in the state we found it
-                # (pending OR running-expired) AND id matches
-                claim_query = """
-                    UPDATE tasks
-                    SET state='running', worker_id=?, lease_expires_at=?, started_at=?
-                    WHERE id = ?
-                    AND (
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                query = f"""
+                    SELECT * FROM tasks
+                    WHERE (
                         state='pending'
                         OR (state='running' AND lease_expires_at < ?)
                     )
-                    RETURNING *
+                    AND (scheduled_for IS NULL OR scheduled_for <= ?)
+                    AND kind != 'signal'
+                    {queue_clause}
+                    ORDER BY priority DESC, created_at ASC
+                    LIMIT 50
                 """
-                # For lease check in UPDATE, we need to pass 'now' again
-                # row["lease_expires_at"] logic is complex because we are allowing re-claim of expired.
-                # The condition in UPDATE must match the condition in SELECT regarding lease expiration.
-                
-                claim_params = (worker_id, expires_at, now, row["id"], now)
-                
-                async with db.execute(claim_query, claim_params) as claim_cursor:
-                    claimed_row = await claim_cursor.fetchone()
-                    if claimed_row:
-                        await db.commit()
-                        return self._row_to_task(claimed_row)
-            
-            return None
+                async with db.execute(query, tuple(params)) as cursor:
+                    candidates = await cursor.fetchall()
+
+                if not candidates:
+                    await db.rollback()
+                    return None
+
+                for row in candidates:
+                    step_name = row["step_name"]
+                    limit = concurrency_limits.get(step_name) if concurrency_limits else None
+
+                    if limit is not None:
+                        count_query = """
+                            SELECT COUNT(*) FROM tasks 
+                            WHERE step_name = ? 
+                            AND state = 'running' 
+                            AND lease_expires_at > ?
+                        """
+                        async with db.execute(count_query, (step_name, now)) as count_cursor:
+                            count_row = await count_cursor.fetchone()
+                            current_count = count_row[0] if count_row else 0
+
+                        if current_count >= limit:
+                            continue
+
+                    claim_query = """
+                        UPDATE tasks
+                        SET state='running', worker_id=?, lease_expires_at=?, started_at=?
+                        WHERE id = ?
+                        AND (
+                            state='pending'
+                            OR (state='running' AND lease_expires_at < ?)
+                        )
+                        RETURNING *
+                    """
+                    claim_params = (worker_id, expires_at, now, row["id"], now)
+
+                    async with db.execute(claim_query, claim_params) as claim_cursor:
+                        claimed_row = await claim_cursor.fetchone()
+                        if claimed_row:
+                            await db.commit()
+                            return self._row_to_task(claimed_row)
+
+                await db.rollback()
+                return None
+            except Exception:
+                await db.rollback()
+                raise
 
     async def list_tasks_for_execution(self, execution_id: str) -> List[TaskRecord]:
         async with aiosqlite.connect(self.db_path) as db:

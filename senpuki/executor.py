@@ -578,8 +578,12 @@ class Senpuki:
             scheduled_for=scheduled_for
         )
         
-        await self.backend.create_execution(record)
-        await self.backend.create_task(task)
+        create_with_root = getattr(self.backend, "create_execution_with_root_task", None)
+        if callable(create_with_root):
+            await create_with_root(record, task)
+        else:
+            await self.backend.create_execution(record)
+            await self.backend.create_task(task)
         
         return execution_id
 

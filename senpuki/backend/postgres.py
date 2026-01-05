@@ -88,6 +88,10 @@ class PostgresBackend(Backend):
                     scheduled_for TIMESTAMP
                 )
             """)
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_state_queue_scheduled ON tasks(state, queue, scheduled_for)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_priority_created ON tasks(priority, created_at)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_execution ON tasks(execution_id)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_step_lease ON tasks(step_name, state, lease_expires_at)")
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS dead_tasks (
                     id TEXT PRIMARY KEY,
@@ -110,21 +114,84 @@ class PostgresBackend(Backend):
                 )
             """)
 
+    def _execution_row_values(self, record: ExecutionRecord) -> tuple[Any, ...]:
+        return (
+            record.id,
+            record.root_function,
+            record.state,
+            record.args,
+            record.kwargs,
+            record.result,
+            record.error,
+            record.retries,
+            record.created_at,
+            record.started_at,
+            record.completed_at,
+            record.expiry_at,
+            json.dumps(record.tags),
+            record.priority,
+            record.queue,
+        )
+
+    async def _insert_execution(self, conn: asyncpg.Connection, record: ExecutionRecord) -> None:
+        await conn.execute(
+            "INSERT INTO executions (id, root_function, state, args, kwargs, result, error, retries, created_at, started_at, completed_at, expiry_at, tags, priority, queue) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+            *self._execution_row_values(record),
+        )
+        for p in record.progress:
+            await conn.execute(
+                "INSERT INTO execution_progress (execution_id, step, status, started_at, completed_at, detail) VALUES ($1, $2, $3, $4, $5, $6)",
+                record.id,
+                p.step,
+                p.status,
+                p.started_at,
+                p.completed_at,
+                p.detail,
+            )
+
+    def _task_row_values(self, task: TaskRecord) -> tuple[Any, ...]:
+        return (
+            task.id,
+            task.execution_id,
+            task.step_name,
+            task.kind,
+            task.parent_task_id,
+            task.state,
+            task.args,
+            task.kwargs,
+            task.result,
+            task.error,
+            task.retries,
+            task.created_at,
+            task.started_at,
+            task.completed_at,
+            task.worker_id,
+            task.lease_expires_at,
+            json.dumps(task.tags),
+            task.priority,
+            task.queue,
+            task.idempotency_key,
+            self._policy_to_json(task.retry_policy),
+            task.scheduled_for,
+        )
+
+    async def _insert_task(self, conn: asyncpg.Connection, task: TaskRecord) -> None:
+        await conn.execute(
+            "INSERT INTO tasks (id, execution_id, step_name, kind, parent_task_id, state, args, kwargs, result, error, retries, created_at, started_at, completed_at, worker_id, lease_expires_at, tags, priority, queue, idempotency_key, retry_policy, scheduled_for) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)",
+            *self._task_row_values(task),
+        )
+
     async def create_execution(self, record: ExecutionRecord) -> None:
         assert self.pool is not None
         async with self.pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO executions (id, root_function, state, args, kwargs, result, error, retries, created_at, started_at, completed_at, expiry_at, tags, priority, queue) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
-                record.id, record.root_function, record.state, record.args, record.kwargs,
-                record.result, record.error, record.retries, record.created_at,
-                record.started_at, record.completed_at, record.expiry_at,
-                json.dumps(record.tags), record.priority, record.queue
-            )
-            for p in record.progress:
-                await conn.execute(
-                    "INSERT INTO execution_progress (execution_id, step, status, started_at, completed_at, detail) VALUES ($1, $2, $3, $4, $5, $6)",
-                    record.id, p.step, p.status, p.started_at, p.completed_at, p.detail
-                )
+            await self._insert_execution(conn, record)
+
+    async def create_execution_with_root_task(self, record: ExecutionRecord, task: TaskRecord) -> None:
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await self._insert_execution(conn, record)
+                await self._insert_task(conn, task)
 
     async def get_execution(self, execution_id: str) -> ExecutionRecord | None:
         assert self.pool is not None
@@ -184,15 +251,7 @@ class PostgresBackend(Backend):
         async with self.pool.acquire() as conn:
             await conn.executemany(
                 "INSERT INTO tasks (id, execution_id, step_name, kind, parent_task_id, state, args, kwargs, result, error, retries, created_at, started_at, completed_at, worker_id, lease_expires_at, tags, priority, queue, idempotency_key, retry_policy, scheduled_for) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)",
-                [
-                    (
-                        task.id, task.execution_id, task.step_name, task.kind, task.parent_task_id,
-                        task.state, task.args, task.kwargs, task.result, task.error, task.retries,
-                        task.created_at, task.started_at, task.completed_at, task.worker_id,
-                        task.lease_expires_at, json.dumps(task.tags), task.priority, task.queue,
-                        task.idempotency_key, self._policy_to_json(task.retry_policy), task.scheduled_for
-                    ) for task in tasks
-                ]
+                [self._task_row_values(task) for task in tasks],
             )
 
     async def count_tasks(self, queue: str | None = None, state: str | None = None) -> int:
