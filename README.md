@@ -39,6 +39,23 @@ async def main():
 asyncio.run(main())
 ```
 
+## Why Senpuki?
+
+| Feature | Temporal | Celery | Prefect | Airflow | **Senpuki** |
+|---------|----------|--------|---------|---------|-------------|
+| Durable Execution | Yes | No | Partial | No | **Yes** |
+| Setup Complexity | High | Medium | Medium | High | **Very Low** |
+| Infrastructure | Server cluster | Broker | Server | Multi-component | **SQLite/Postgres** |
+| Native Async | Yes | No | Yes | Limited | **Yes** |
+
+Senpuki fills the gap between simple task queues (Celery) and enterprise platforms (Temporal):
+
+- **vs Temporal**: Same durability guarantees, fraction of the infrastructure
+- **vs Celery/Dramatiq**: True workflow durability, not just task retries
+- **vs Prefect/Airflow**: Application workflows, not batch data pipelines
+
+See [full comparison](docs/comparison.md) for details.
+
 ## Features
 
 - **Durable Execution** - Workflow state survives crashes and restarts
@@ -109,7 +126,7 @@ senpuki dlq replay <task_id>    # Replay failed task
 
 Full documentation available in [`docs/`](docs/):
 
-- [Getting Started](docs/getting-started.md) | [Core Concepts](docs/core-concepts.md)
+- [Getting Started](docs/getting-started.md) | [Core Concepts](docs/core-concepts.md) | [Comparison](docs/comparison.md)
 - **Guides**: [Durable Functions](docs/guides/durable-functions.md) | [Orchestration](docs/guides/orchestration.md) | [Error Handling](docs/guides/error-handling.md) | [Parallel Execution](docs/guides/parallel-execution.md) | [Signals](docs/guides/signals.md) | [Workers](docs/guides/workers.md) | [Monitoring](docs/guides/monitoring.md)
 - **Patterns**: [Saga](docs/patterns/saga.md) | [Batch Processing](docs/patterns/batch-processing.md)
 - **Reference**: [API](docs/api-reference/senpuki.md) | [Configuration](docs/configuration.md) | [Deployment](docs/deployment.md)

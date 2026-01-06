@@ -139,6 +139,7 @@ asyncio.run(main())
 - [Notifications](api-reference/notifications.md)
 - [Configuration Reference](configuration.md)
 - [Deployment Guide](deployment.md)
+- [Comparison with Other Libraries](comparison.md)
 
 ## Requirements
 
