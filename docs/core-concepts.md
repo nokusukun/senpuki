@@ -137,6 +137,8 @@ Execution properties:
 | `tags` | User-defined tags for filtering |
 | `priority` | Priority level (higher = processed first) |
 | `queue` | Queue name for routing |
+| `counters` | Execution-scoped numeric counters |
+| `custom_state` | Execution-scoped custom key-value state |
 
 ### Task
 
@@ -364,6 +366,8 @@ async def charge_customer():
 # Worker only processes tasks with matching tags
 await executor.serve(tags=["billing"])
 ```
+
+Tag matching is inclusive for untagged tasks: workers configured with `tags=[...]` can claim matching tagged tasks plus untagged tasks.
 
 ## Next Steps
 

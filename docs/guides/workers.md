@@ -187,7 +187,7 @@ async def send_alert():
 ```
 
 ```python
-# Billing worker (billing OR notifications)
+# Billing worker (billing-tagged + untagged tasks)
 await executor.serve(
     worker_id="billing-worker",
     tags=["billing"],

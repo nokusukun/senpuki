@@ -107,6 +107,10 @@ asyncio.run(main())
 - [Quick Start](getting-started.md#quick-start)
 - [Your First Workflow](getting-started.md#your-first-workflow)
 
+### What's New
+
+- [Feature Updates (019-034)](feature-updates.md)
+
 ### Core Concepts
 
 - [Durable Functions](core-concepts.md#durable-functions)

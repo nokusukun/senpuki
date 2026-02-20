@@ -58,8 +58,28 @@ senpuki show 550e8400-e29b-41d4-a716-446655440000
 # [10:30:15] + send_notification (completed)
 # [10:31:30] + order_workflow (completed)
 #
+# Counters:
+# - progress: 42
+#
+# Custom State:
+# - phase: completed
+# - owner: billing-pipeline
+#
 # Result: {"order_id": "ORD-123", "status": "completed"}
 ```
+
+### Quick Stats and Live Watch
+
+```bash
+# One-shot execution and queue stats
+senpuki stats
+
+# Live terminal dashboard
+senpuki watch
+senpuki watch --interval 1.0
+```
+
+`stats` and `watch` use backend count queries for scalable totals (executions by state, pending tasks, and dead-letter counts).
 
 ### Dead Letter Queue Management
 

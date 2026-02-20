@@ -220,6 +220,8 @@ async def dispatch(
 
 Duration strings support: `s` (seconds), `m` (minutes), `h` (hours), `d` (days), `w` (weeks)
 
+Parsing is strict: the full string must be valid (no trailing text and no embedded spaces).
+
 ```python
 "30s"      # 30 seconds
 "5m"       # 5 minutes
@@ -366,6 +368,8 @@ async def state_of(self, execution_id: str) -> ExecutionState:
 | `tags` | `List[str]` | Tags |
 | `priority` | `int` | Priority |
 | `queue` | `str \| None` | Queue |
+| `counters` | `dict[str, int \| float]` | Execution-scoped counters |
+| `custom_state` | `dict[str, Any]` | Execution-scoped custom state |
 | `progress_str` | `str` | Human-readable progress string |
 
 #### Example
@@ -565,6 +569,34 @@ async def discard_dead_letter(self, task_id: str) -> bool:
 ---
 
 ## Static Methods
+
+### `Senpuki.context()`
+
+Access execution-scoped counters and custom state from inside a durable function.
+
+```python
+@classmethod
+def context(
+    cls,
+    *,
+    counters: dict[str, int | float] | None = None,
+    state: dict[str, Any] | None = None,
+) -> ExecutionContext:
+```
+
+Notes:
+- Must be called within an active durable execution.
+- `counters`/`state` initialize defaults if values are not present yet.
+
+```python
+@Senpuki.durable()
+async def workflow():
+    ctx = Senpuki.context(counters={"progress": 0}, state={"phase": "start"})
+    ctx.counters("progress").add(1)
+    ctx.state("phase").set("running")
+```
+
+---
 
 ### `Senpuki.sleep()`
 
